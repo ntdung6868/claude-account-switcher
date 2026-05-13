@@ -80,20 +80,23 @@ sudo ln -s "$PWD/csw" /usr/local/bin/csw   # global
 # …or add the repo dir to PATH in your shell rc.
 ```
 
-### Optional nicety
-
-Make plain `claude` use the active account, too:
-
-```sh
-# ~/.zshrc
-alias claude='csw run'
-```
-
-Reload your shell, and:
+### Reload your shell, and you're done
 
 ```sh
 csw          # opens the menu
 csw help     # full CLI reference
+```
+
+`csw` is **completely independent** of the official `claude` CLI. It doesn't wrap or shadow it — `claude` keeps doing exactly what it always did. All `csw` does is swap which credentials are sitting in `~/.claude/.credentials.json` and the Keychain when you say "use this profile". The next `claude` call picks them up naturally.
+
+The typical workflow is:
+
+```sh
+csw use work
+claude          # now logged in as the "work" profile
+# ... later ...
+csw use personal
+claude          # now logged in as "personal"
 ```
 
 Profiles and state live in `~/.claude-switcher/` regardless of where the script is installed. Override with `CLAUDE_ACCOUNT_DIR=/some/path`.
@@ -128,11 +131,11 @@ csw save-native work
 
 ```sh
 csw use personal
-claude                                # if you aliased it; otherwise: csw run
+claude                                # the official Claude CLI now uses 'personal'
 # ... do stuff as personal ...
 
 csw use work
-claude
+claude                                # ... and now 'work'
 # ... do stuff as work ...
 ```
 
