@@ -1,5 +1,10 @@
 # csw — Claude Account Switcher
 
+[![npm version](https://img.shields.io/npm/v/claude-cli-switcher.svg)](https://www.npmjs.com/package/claude-cli-switcher)
+[![npm downloads](https://img.shields.io/npm/dm/claude-cli-switcher.svg)](https://www.npmjs.com/package/claude-cli-switcher)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform: macOS · Linux](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux-lightgrey.svg)](#requirements)
+
 Switch between multiple **Claude Code** (Anthropic) accounts on the same machine in one command. Native Claude Pro logins (refresh token + access token + organization metadata) are snapshotted per profile, so `/status` keeps showing the right Email and Organization no matter which account you're using.
 
 ```sh
