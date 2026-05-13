@@ -59,19 +59,30 @@ The official `claude` CLI stores **one** set of credentials at a time — in `~/
 
 ## Installation
 
-```sh
-git clone https://github.com/ntdung6868/claude-account-switcher.git ~/.claude-switcher
-chmod +x ~/.claude-switcher/csw
-```
-
-Then add the directory to your `PATH` (recommended):
+### Option 1 — npm (recommended)
 
 ```sh
-# ~/.zshrc
-export PATH="$HOME/.claude-switcher:$PATH"
+npm install -g claude-cli-switcher
 ```
 
-Optional but nice — make plain `claude` use the active account too:
+That puts `csw` on your `PATH`. Done.
+
+### Option 2 — git clone
+
+```sh
+git clone https://github.com/ntdung6868/claude-account-switcher.git
+cd claude-account-switcher
+chmod +x csw
+
+# Put csw on your PATH (any one of these):
+ln -s "$PWD/csw" ~/.local/bin/csw          # if ~/.local/bin is on PATH
+sudo ln -s "$PWD/csw" /usr/local/bin/csw   # global
+# …or add the repo dir to PATH in your shell rc.
+```
+
+### Optional nicety
+
+Make plain `claude` use the active account, too:
 
 ```sh
 # ~/.zshrc
@@ -84,6 +95,8 @@ Reload your shell, and:
 csw          # opens the menu
 csw help     # full CLI reference
 ```
+
+Profiles and state live in `~/.claude-switcher/` regardless of where the script is installed. Override with `CLAUDE_ACCOUNT_DIR=/some/path`.
 
 ---
 
@@ -157,7 +170,7 @@ csw list
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CLAUDE_ACCOUNT_DIR` | directory containing the script | Where profiles, lock, and state files live. |
+| `CLAUDE_ACCOUNT_DIR` | `$HOME/.claude-switcher` | Where profiles, lock, and state files live. |
 | `CLAUDE_HOME_DIR` | `$HOME/.claude` | Real Claude config dir, where `.credentials.json` lives. |
 | `CLAUDE_JSON_FILE` | `$HOME/.claude.json` | Real Claude top-level config (holds `oauthAccount`). |
 | `CLAUDE_REAL_BIN` | (auto-detected) | Absolute path to the real `claude` CLI. The script searches `$HOME/.local/bin/claude`, `$HOME/.claude/local/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude` in order; set this if your install is elsewhere. |

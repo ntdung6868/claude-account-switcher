@@ -3,3 +3,8 @@ active.mode
 active.native
 .lock/
 .claude/
+
+# local-only compatibility shims (re-created by users who keep old aliases)
+/claude
+/claude-account
+*.tgz

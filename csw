@@ -9,7 +9,7 @@ umask 077
 # ============================================================================
 
 SCRIPT_DIR="${0:A:h}"
-BASE_DIR="${CLAUDE_ACCOUNT_DIR:-$SCRIPT_DIR}"
+BASE_DIR="${CLAUDE_ACCOUNT_DIR:-$HOME/.claude-switcher}"
 NATIVE_ACCOUNTS_DIR="$BASE_DIR/native-accounts"
 ACTIVE_MODE="$BASE_DIR/active.mode"
 ACTIVE_NATIVE="$BASE_DIR/active.native"
