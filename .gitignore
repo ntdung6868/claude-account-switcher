@@ -1,3 +1,5 @@
 native-accounts/
 active.mode
 active.native
+.lock/
+.claude/

@@ -1,0 +1,854 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+umask 077
+
+# ============================================================================
+# csw — Claude Account Switcher
+# Switch between multiple Claude Code (Anthropic Pro) accounts on one machine.
+# Run with no args for an interactive menu.
+# ============================================================================
+
+SCRIPT_DIR="${0:A:h}"
+BASE_DIR="${CLAUDE_ACCOUNT_DIR:-$SCRIPT_DIR}"
+NATIVE_ACCOUNTS_DIR="$BASE_DIR/native-accounts"
+ACTIVE_MODE="$BASE_DIR/active.mode"
+ACTIVE_NATIVE="$BASE_DIR/active.native"
+CLAUDE_HOME="${CLAUDE_HOME_DIR:-$HOME/.claude}"
+CLAUDE_JSON="${CLAUDE_JSON_FILE:-$HOME/.claude.json}"
+CREDENTIALS_FILE="$CLAUDE_HOME/.credentials.json"
+LOCK_DIR="$BASE_DIR/.lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
+
+# ============================================================================
+# Cleanup trap
+# ============================================================================
+
+typeset -i _CURSOR_HIDDEN=0
+
+_cleanup_on_exit() {
+  if (( _CURSOR_HIDDEN )) && [[ -t 2 ]]; then
+    print -nu 2 -- $'\033[?25h' 2>/dev/null || true
+  fi
+  if [[ -f "$LOCK_PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$LOCK_PID_FILE" 2>/dev/null)" || pid=""
+    if [[ "$pid" == "$$" ]]; then
+      rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
+  fi
+}
+trap _cleanup_on_exit EXIT
+trap '_cleanup_on_exit; exit 130' INT
+trap '_cleanup_on_exit; exit 143' TERM
+
+die() {
+  print -u2 -- "Error: $*"
+  exit 1
+}
+
+# ============================================================================
+# Filesystem
+# ============================================================================
+
+ensure_dirs() {
+  mkdir -p "$NATIVE_ACCOUNTS_DIR"
+  chmod 700 "$BASE_DIR" "$NATIVE_ACCOUNTS_DIR"
+}
+
+safe_name() {
+  local name="$1"
+  [[ "$name" =~ '^[A-Za-z0-9._-]+$' ]] \
+    || die "account name may only contain letters, numbers, dot, underscore, and dash"
+}
+
+native_dir() {
+  local name="$1"
+  safe_name "$name"
+  print -- "$NATIVE_ACCOUNTS_DIR/$name"
+}
+
+native_credentials_path() {
+  local name="$1"
+  print -- "$(native_dir "$name")/.credentials.json"
+}
+
+# ============================================================================
+# Lock
+# ============================================================================
+
+acquire_lock() {
+  local max_wait="${CLAUDE_LOCK_TIMEOUT:-30}"
+  local waited=0
+  local lock_pid
+  mkdir -p "$BASE_DIR"
+
+  if [[ -f "$LOCK_PID_FILE" && "$(cat "$LOCK_PID_FILE" 2>/dev/null)" == "$$" ]]; then
+    return 0
+  fi
+
+  while true; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      print -- "$$" > "$LOCK_PID_FILE"
+      return
+    fi
+    lock_pid=""
+    [[ -f "$LOCK_PID_FILE" ]] && lock_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$lock_pid" && "$lock_pid" != "$$" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    if (( waited >= max_wait )); then
+      die "could not acquire lock after ${max_wait}s. Another csw process is running (PID ${lock_pid:-unknown}). Remove $LOCK_DIR manually if no process is running."
+    fi
+    sleep 1
+    (( waited++ )) || true
+  done
+}
+
+release_lock() {
+  if [[ -f "$LOCK_PID_FILE" && "$(cat "$LOCK_PID_FILE" 2>/dev/null)" == "$$" ]]; then
+    rm -rf "$LOCK_DIR"
+  fi
+}
+
+# ============================================================================
+# Keychain (macOS)
+# ============================================================================
+
+keychain_account() {
+  local account="${USER:-}"
+  if [[ -z "$account" ]]; then
+    account="$(whoami 2>/dev/null || true)"
+  fi
+  [[ "$account" =~ '^[A-Za-z0-9._-]+$' ]] || account="claude-code-user"
+  print -- "$account"
+}
+
+keychain_service() {
+  local suffix=""
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    suffix="-$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 | awk '{print substr($1,1,8)}')"
+  fi
+  print -- "Claude Code-credentials$suffix"
+}
+
+read_native_credentials() {
+  if [[ -f "$CREDENTIALS_FILE" ]]; then
+    cat "$CREDENTIALS_FILE"
+    return
+  fi
+  local service account
+  service="$(keychain_service)"
+  account="$(keychain_account)"
+  security find-generic-password -a "$account" -w -s "$service" 2>/dev/null || true
+}
+
+write_native_credentials() {
+  local credential_file="$1"
+  mkdir -p "$CLAUDE_HOME"
+  chmod 700 "$CLAUDE_HOME"
+  cp "$credential_file" "$CREDENTIALS_FILE"
+  chmod 600 "$CREDENTIALS_FILE"
+
+  if command -v security >/dev/null 2>&1; then
+    local service account hex
+    service="$(keychain_service)"
+    account="$(keychain_account)"
+    hex="$(od -An -tx1 -v "$credential_file" | tr -d ' \n')"
+    if [[ -n "$hex" ]]; then
+      security add-generic-password -U -a "$account" -s "$service" -X "$hex" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+clear_live_credentials() {
+  rm -f "$CREDENTIALS_FILE"
+  if command -v security >/dev/null 2>&1; then
+    local service account
+    service="$(keychain_service)"
+    account="$(keychain_account)"
+    security delete-generic-password -a "$account" -s "$service" >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$CLAUDE_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    local tmp
+    tmp="$(mktemp "${CLAUDE_JSON}.tmp.XXXXXX")"
+    jq 'del(.oauthAccount)' "$CLAUDE_JSON" > "$tmp"
+    mv "$tmp" "$CLAUDE_JSON"
+    chmod 600 "$CLAUDE_JSON" 2>/dev/null || true
+  fi
+}
+
+# ============================================================================
+# Credential validation
+# ============================================================================
+
+validate_credentials_string() {
+  local data="$1"
+  local context="$2"
+  command -v jq >/dev/null 2>&1 || return 0
+
+  printf '%s' "$data" | jq -e '.' >/dev/null 2>&1 \
+    || die "$context are not valid JSON"
+
+  if printf '%s' "$data" | jq -e '.claudeAiOauth.refreshToken and .claudeAiOauth.accessToken' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -n "${CLAUDE_SKIP_VALIDATION:-}" ]]; then
+    print -u2 -- "Warning: $context do not match the expected schema (.claudeAiOauth.{refreshToken,accessToken}). Proceeding because CLAUDE_SKIP_VALIDATION is set."
+    return 0
+  fi
+
+  die "$context are not a full Claude Pro login. If the Claude CLI schema changed, retry with CLAUDE_SKIP_VALIDATION=1."
+}
+
+validate_credentials_file() {
+  local file="$1"
+  local context="$2"
+  validate_credentials_string "$(cat "$file")" "$context"
+}
+
+# ============================================================================
+# Core operations
+# ============================================================================
+
+save_native() {
+  local name="$1"
+  local profile_dir credential_file account_file
+  profile_dir="$(native_dir "$name")"
+  credential_file="$profile_dir/.credentials.json"
+  account_file="$profile_dir/oauthAccount.json"
+  ensure_dirs
+
+  local credentials_json
+  credentials_json="$(read_native_credentials)"
+  [[ -n "$credentials_json" ]] || die "native credentials not found. Run: csw use-native && csw run auth login --claudeai"
+  validate_credentials_string "$credentials_json" "current credentials"
+
+  mkdir -p "$profile_dir"
+  chmod 700 "$profile_dir"
+  printf '%s' "$credentials_json" > "$credential_file"
+  chmod 600 "$credential_file"
+
+  if [[ -f "$CLAUDE_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    jq '.oauthAccount // empty' "$CLAUDE_JSON" > "$account_file"
+    chmod 600 "$account_file"
+  fi
+
+  print -r -- "native-profile" > "$ACTIVE_MODE"
+  print -r -- "$name" > "$ACTIVE_NATIVE"
+  chmod 600 "$ACTIVE_MODE" "$ACTIVE_NATIVE"
+  print -- "Saved native Claude Pro profile: $name"
+}
+
+use_account() {
+  local name="$1"
+  if [[ "$name" == "native-login" ]]; then
+    use_native
+    return
+  fi
+  [[ -f "$(native_credentials_path "$name")" ]] || die "unknown account: $name"
+  use_native_profile "$name"
+}
+
+remove_native() {
+  local name="$1"
+  local profile_dir
+  profile_dir="$(native_dir "$name")"
+  [[ -d "$profile_dir" ]] || die "native profile not found: $name"
+  local was_active=0
+  if [[ -f "$ACTIVE_NATIVE" && "$(active_mode)" == "native-profile" && "$(cat "$ACTIVE_NATIVE")" == "$name" ]]; then
+    was_active=1
+  fi
+  rm -rf "$profile_dir"
+  if (( was_active )); then
+    clear_live_credentials
+    rm -f "$ACTIVE_NATIVE"
+    use_native
+  fi
+  print -- "Removed native profile: $name"
+}
+
+use_native_profile() {
+  local name="$1"
+  local profile_dir credential_file account_file
+  profile_dir="$(native_dir "$name")"
+  credential_file="$profile_dir/.credentials.json"
+  account_file="$profile_dir/oauthAccount.json"
+  [[ -f "$credential_file" ]] || die "unknown native profile: $name"
+  validate_credentials_file "$credential_file" "saved credentials for '$name'"
+  ensure_dirs
+  write_native_credentials "$credential_file"
+
+  if [[ -s "$account_file" && -f "$CLAUDE_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    local account_trimmed
+    account_trimmed="$(tr -d '[:space:]' < "$account_file")"
+    if [[ -n "$account_trimmed" && "$account_trimmed" != "null" ]]; then
+      local tmp
+      tmp="$(mktemp "${CLAUDE_JSON}.tmp.XXXXXX")"
+      jq --slurpfile account "$account_file" '.oauthAccount = $account[0]' "$CLAUDE_JSON" > "$tmp"
+      mv "$tmp" "$CLAUDE_JSON"
+      chmod 600 "$CLAUDE_JSON" 2>/dev/null || true
+    fi
+  fi
+
+  print -r -- "native-profile" > "$ACTIVE_MODE"
+  print -r -- "$name" > "$ACTIVE_NATIVE"
+  chmod 600 "$ACTIVE_MODE" "$ACTIVE_NATIVE"
+  print -- "Active Claude native profile: $name"
+}
+
+use_native() {
+  ensure_dirs
+  print -r -- "native" > "$ACTIVE_MODE"
+  chmod 600 "$ACTIVE_MODE"
+  rm -f "$ACTIVE_NATIVE"
+  print -- "Active Claude mode: native login"
+}
+
+# ============================================================================
+# Query
+# ============================================================================
+
+active_mode() {
+  local mode=""
+  [[ -f "$ACTIVE_MODE" ]] && mode="$(cat "$ACTIVE_MODE")"
+  case "$mode" in
+    native|native-profile) print -- "$mode" ;;
+    *) print -- "native" ;;
+  esac
+}
+
+active_name() {
+  [[ -f "$ACTIVE_NATIVE" && "$(active_mode)" == "native-profile" ]] || return 1
+  cat "$ACTIVE_NATIVE"
+}
+
+list_accounts() {
+  ensure_dirs
+  local current=""
+  current="$(active_name 2>/dev/null || true)"
+  local mode=""
+  mode="$(active_mode 2>/dev/null || true)"
+  if [[ "$mode" == "native" ]]; then
+    print -- "* native-login"
+  else
+    print -- "  native-login"
+  fi
+  local native_profile native_acct native_marker
+  while IFS= read -r native_profile; do
+    [[ -d "$native_profile" ]] || continue
+    [[ -f "$native_profile/.credentials.json" ]] || continue
+    native_acct="$(basename "$native_profile")"
+    native_marker=" "
+    [[ "$mode" == "native-profile" && "$native_acct" == "$current" ]] && native_marker="*"
+    print -- "$native_marker $native_acct (native)"
+  done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+}
+
+list_profiles_raw() {
+  print -- "native-login"
+  local p
+  while IFS= read -r p; do
+    [[ -d "$p" ]] || continue
+    [[ -f "$p/.credentials.json" ]] || continue
+    basename "$p"
+  done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+}
+
+list_named_profiles() {
+  local p
+  while IFS= read -r p; do
+    [[ -d "$p" ]] || continue
+    [[ -f "$p/.credentials.json" ]] || continue
+    basename "$p"
+  done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+}
+
+# ============================================================================
+# Real Claude binary
+# ============================================================================
+
+real_claude() {
+  if [[ -n "${CLAUDE_REAL_BIN:-}" ]]; then
+    [[ -x "$CLAUDE_REAL_BIN" ]] \
+      || die "CLAUDE_REAL_BIN is not executable: $CLAUDE_REAL_BIN"
+    print -- "$CLAUDE_REAL_BIN"
+    return
+  fi
+  local base_resolved candidate resolved
+  base_resolved="${BASE_DIR:A}"
+  for candidate in \
+    "$HOME/.local/bin/claude" \
+    "$HOME/.claude/local/claude" \
+    "/opt/homebrew/bin/claude" \
+    "/usr/local/bin/claude"; do
+    [[ -x "$candidate" ]] || continue
+    resolved="${candidate:A}"
+    [[ "${resolved:h}" == "$base_resolved" ]] && continue
+    print -- "$resolved"
+    return
+  done
+  die "Could not find the real Claude binary. Set CLAUDE_REAL_BIN to its absolute path (e.g. \$HOME/.local/bin/claude)."
+}
+
+run_claude() {
+  local bin
+  bin="$(real_claude)"
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  unset ANTHROPIC_AUTH_TOKEN
+  exec "$bin" "$@"
+}
+
+# ============================================================================
+# Interactive UI
+# ============================================================================
+
+ui_print()       { print -rP -- "$@" >&2; }
+ui_printn()      { print -nrP -- "$@" >&2; }
+ui_clear()       { print -n -- $'\033[2J\033[H' >&2; }
+ui_hide_cursor() { print -n -- $'\033[?25l' >&2; _CURSOR_HIDDEN=1; }
+ui_show_cursor() { print -n -- $'\033[?25h' >&2; _CURSOR_HIDDEN=0; }
+ui_clear_line()  { print -n -- $'\033[K' >&2; }
+ui_cursor_up()   { print -n -- $'\033['"$1"'A' >&2; }
+
+read_key() {
+  local k1 k2 k3
+  if ! IFS= read -rsk 1 k1 < /dev/tty 2>/dev/null; then
+    print -- ESC
+    return
+  fi
+  case "$k1" in
+    $'\x1b')
+      k2=""
+      IFS= read -rsk 1 -t 0.05 k2 < /dev/tty 2>/dev/null || true
+      if [[ "${k2:-}" != "[" ]]; then
+        print -- ESC
+        return
+      fi
+      if ! IFS= read -rsk 1 k3 < /dev/tty 2>/dev/null; then
+        print -- ESC
+        return
+      fi
+      case "$k3" in
+        A) print -- UP ;;
+        B) print -- DOWN ;;
+        C) print -- RIGHT ;;
+        D) print -- LEFT ;;
+        *) print -- OTHER ;;
+      esac
+      ;;
+    $'\n'|$'\r'|"") print -- ENTER ;;
+    q|Q)             print -- QUIT ;;
+    j)               print -- DOWN ;;
+    k)               print -- UP ;;
+    *)               print -- "$k1" ;;
+  esac
+}
+
+menu_select() {
+  local title="$1"
+  shift
+  local items=("$@")
+  local n=$#items
+  local selected=1
+  local key i
+
+  ui_hide_cursor
+
+  draw() {
+    ui_print "%F{cyan}${title}%f"
+    ui_print ""
+    for i in {1..$n}; do
+      ui_clear_line
+      if (( i == selected )); then
+        ui_print "  %F{green}❯%f %B${items[i]}%b"
+      else
+        ui_print "    %F{8}${items[i]}%f"
+      fi
+    done
+    ui_print ""
+    ui_print "%F{8}[↑↓ navigate · Enter select · Esc/q back]%f"
+  }
+
+  draw
+  local total_lines=$((n + 4))
+
+  while true; do
+    key="$(read_key)"
+    case "$key" in
+      UP)
+        (( selected-- ))
+        (( selected < 1 )) && selected=$n
+        ;;
+      DOWN)
+        (( selected++ ))
+        (( selected > n )) && selected=1
+        ;;
+      ENTER)
+        ui_show_cursor
+        print -- "$selected"
+        return 0
+        ;;
+      ESC|QUIT)
+        ui_show_cursor
+        return 1
+        ;;
+      *) continue ;;
+    esac
+    ui_cursor_up $total_lines
+    draw
+  done
+}
+
+prompt_text() {
+  local question="$1"
+  local default="${2:-}"
+  ui_show_cursor
+  ui_printn "%F{cyan}?%f %B${question}%b "
+  [[ -n "$default" ]] && ui_printn "%F{8}(${default})%f "
+  local input=""
+  IFS= read -r input < /dev/tty 2>/dev/null || input=""
+  if [[ -z "$input" && -n "$default" ]]; then
+    print -- "$default"
+  else
+    print -- "$input"
+  fi
+}
+
+confirm() {
+  local question="$1"
+  local choice
+  if ! choice="$(menu_select "$question" "No" "Yes")"; then
+    return 1
+  fi
+  [[ "$choice" == "2" ]]
+}
+
+ui_pause() {
+  ui_print ""
+  ui_printn "%F{8}Press any key to continue…%f"
+  read_key >/dev/null
+}
+
+print_header() {
+  local active_label
+  active_label="$(active_name 2>/dev/null || true)"
+  [[ -z "$active_label" ]] && active_label="native-login"
+  local profile_count
+  profile_count=$(list_named_profiles | wc -l | tr -d ' ')
+
+  ui_print "%F{cyan}╭───────────────────────────────────────────╮%f"
+  ui_print "%F{cyan}│%f  %Bcsw%b — Claude Account Switcher"
+  ui_print "%F{cyan}├───────────────────────────────────────────┤%f"
+  ui_print "%F{cyan}│%f  %F{yellow}⚡%f Active:   %F{green}${active_label}%f"
+  ui_print "%F{cyan}│%f  %F{magenta}👤%f Profiles: ${profile_count}"
+  ui_print "%F{cyan}╰───────────────────────────────────────────╯%f"
+  ui_print ""
+}
+
+# ============================================================================
+# Menu actions
+# ============================================================================
+
+menu_switch() {
+  local profiles=()
+  local p
+  while IFS= read -r p; do
+    profiles+=("$p")
+  done < <(list_profiles_raw)
+
+  local mode_now active_now
+  mode_now="$(active_mode)"
+  active_now="$(active_name 2>/dev/null || true)"
+
+  local display=()
+  for p in "${profiles[@]}"; do
+    if [[ ("$mode_now" == "native" && "$p" == "native-login") || \
+          ("$mode_now" == "native-profile" && "$p" == "$active_now") ]]; then
+      display+=("$p  %F{green}✓%f")
+    else
+      display+=("$p")
+    fi
+  done
+
+  ui_clear
+  print_header
+  local choice
+  if ! choice="$(menu_select "Choose profile:" "${display[@]}")"; then
+    return
+  fi
+  local target="${profiles[$choice]}"
+
+  acquire_lock
+  local err rc=0
+  if [[ "$target" == "native-login" ]]; then
+    err="$( (use_native >/dev/null) 2>&1 )" || rc=$?
+  else
+    err="$( (use_native_profile "$target" >/dev/null) 2>&1 )" || rc=$?
+  fi
+  release_lock
+
+  ui_print ""
+  if (( rc == 0 )); then
+    ui_print "%F{green}✓ Switched to %B${target}%b%f"
+  else
+    ui_print "%F{red}✗ ${err}%f"
+  fi
+  ui_pause
+}
+
+menu_save() {
+  ui_clear
+  print_header
+  ui_print "%BSave a Claude Pro account as a new profile%b"
+  ui_print ""
+  ui_print "This will:"
+  ui_print "  %F{8}1.%f Reset to fresh native-login mode"
+  ui_print "  %F{8}2.%f Open the Claude OAuth login flow"
+  ui_print "  %F{8}3.%f Ask for a profile name and snapshot the credentials"
+  ui_print ""
+  if ! confirm "Continue?"; then return; fi
+
+  acquire_lock
+  use_native >/dev/null 2>&1 || true
+  release_lock
+
+  ui_clear
+  print_header
+  ui_print "%F{cyan}Launching Claude login…%f"
+  ui_print "%F{8}(complete the browser flow, then come back here)%f"
+  ui_print ""
+  local bin
+  bin="$(real_claude)"
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  unset ANTHROPIC_AUTH_TOKEN
+  ui_show_cursor
+  if ! "$bin" auth login --claudeai; then
+    ui_print ""
+    ui_print "%F{red}Login failed or was cancelled.%f"
+    ui_pause
+    return
+  fi
+
+  ui_print ""
+  local name
+  name="$(prompt_text "Profile name for this account")"
+  if [[ -z "$name" ]]; then
+    ui_print "%F{red}Cancelled (empty name).%f"
+    ui_pause
+    return
+  fi
+  if ! [[ "$name" =~ '^[A-Za-z0-9._-]+$' ]]; then
+    ui_print "%F{red}Invalid name. Use only letters, numbers, dot, underscore, dash.%f"
+    ui_pause
+    return
+  fi
+  if [[ -d "$NATIVE_ACCOUNTS_DIR/$name" ]]; then
+    if ! confirm "Profile '$name' already exists. Overwrite?"; then return; fi
+  fi
+
+  acquire_lock
+  local err rc=0
+  err="$( (save_native "$name" >/dev/null) 2>&1 )" || rc=$?
+  release_lock
+
+  ui_print ""
+  if (( rc == 0 )); then
+    ui_print "%F{green}✓ Saved profile %B${name}%b%f"
+  else
+    ui_print "%F{red}✗ ${err}%f"
+  fi
+  ui_pause
+}
+
+menu_remove() {
+  local profiles=()
+  local p
+  while IFS= read -r p; do
+    profiles+=("$p")
+  done < <(list_named_profiles)
+
+  ui_clear
+  print_header
+  if [[ ${#profiles[@]} -eq 0 ]]; then
+    ui_print "%F{yellow}No named profiles to remove.%f"
+    ui_pause
+    return
+  fi
+
+  local choice
+  if ! choice="$(menu_select "Choose profile to remove:" "${profiles[@]}")"; then
+    return
+  fi
+  local target="${profiles[$choice]}"
+
+  if ! confirm "Permanently delete profile '$target'?"; then return; fi
+
+  acquire_lock
+  local err rc=0
+  err="$( (remove_native "$target" >/dev/null) 2>&1 )" || rc=$?
+  release_lock
+
+  ui_print ""
+  if (( rc == 0 )); then
+    ui_print "%F{green}✓ Removed profile %B${target}%b%f"
+  else
+    ui_print "%F{red}✗ ${err}%f"
+  fi
+  ui_pause
+}
+
+menu_status() {
+  ui_clear
+  print_header
+  ui_print "%F{cyan}claude auth status%f"
+  ui_print ""
+  local bin
+  bin="$(real_claude)"
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  unset ANTHROPIC_AUTH_TOKEN
+  ui_show_cursor
+  "$bin" auth status || true
+  ui_pause
+}
+
+menu_run_claude() {
+  ui_show_cursor
+  ui_clear
+  run_claude
+}
+
+menu_main() {
+  if ! [[ -t 0 && -r /dev/tty ]]; then
+    die "interactive menu requires a terminal. Run 'csw help' for the CLI commands."
+  fi
+  while true; do
+    ui_clear
+    print_header
+
+    local choice
+    if ! choice="$(menu_select "What do you want to do?" \
+        "Switch account" \
+        "Save current login as new profile" \
+        "Remove a profile" \
+        "Run claude (with active account)" \
+        "Show /status" \
+        "Quit")"; then
+      ui_clear
+      return 0
+    fi
+
+    case "$choice" in
+      1) menu_switch ;;
+      2) menu_save ;;
+      3) menu_remove ;;
+      4) menu_run_claude ;;
+      5) menu_status ;;
+      6) ui_clear; return 0 ;;
+    esac
+  done
+}
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+usage() {
+  cat <<EOF
+csw — Claude Account Switcher
+
+Usage:
+  csw                            Open the interactive menu
+  csw save-native <name>         Snapshot current native login as a profile
+  csw use <name>                 Switch to a saved profile (or 'native-login')
+  csw use-native                 Switch to bare native-login mode
+  csw remove-native <name>       Delete a saved profile
+  csw list                       List all profiles, with active marked
+  csw current                    Print the active profile name
+  csw status                     Run 'claude auth status' on the active account
+  csw run [args...]              Run real claude with the active account
+  csw init                       Create data directories (idempotent)
+  csw help                       Show this help
+
+Flow to add a new account from the CLI:
+  csw use-native
+  csw run auth login --claudeai
+  csw save-native main
+
+…or just run \`csw\` and use the menu.
+
+Environment variables:
+  CLAUDE_ACCOUNT_DIR       Where profiles and state live (default: script dir)
+  CLAUDE_HOME_DIR          Real Claude config dir (default: \$HOME/.claude)
+  CLAUDE_JSON_FILE         Real Claude top-level config (default: \$HOME/.claude.json)
+  CLAUDE_REAL_BIN          Absolute path to the real claude CLI (auto-detected)
+  CLAUDE_LOCK_TIMEOUT      Seconds to wait for lock (default: 30)
+  CLAUDE_SKIP_VALIDATION   Bypass strict credential schema check
+EOF
+}
+
+# ============================================================================
+# Dispatch
+# ============================================================================
+
+cmd="${1:-}"
+case "$cmd" in
+  "")
+    menu_main
+    ;;
+  init)
+    ensure_dirs
+    print -- "Initialized: $BASE_DIR"
+    ;;
+  save-native)
+    shift
+    [[ $# -eq 1 ]] || die "usage: csw save-native <name>"
+    acquire_lock
+    save_native "$1"
+    ;;
+  use)
+    shift
+    [[ $# -eq 1 ]] || die "usage: csw use <name>"
+    acquire_lock
+    use_account "$1"
+    ;;
+  remove-native)
+    shift
+    [[ $# -eq 1 ]] || die "usage: csw remove-native <name>"
+    acquire_lock
+    remove_native "$1"
+    ;;
+  use-native)
+    shift
+    [[ $# -eq 0 ]] || die "usage: csw use-native"
+    acquire_lock
+    use_native
+    ;;
+  list)
+    list_accounts
+    ;;
+  current)
+    if [[ "$(active_mode)" == "native" ]]; then
+      print -- "native-login"
+    else
+      active_name || die "no active account"
+    fi
+    ;;
+  status)
+    run_claude auth status
+    ;;
+  run)
+    shift
+    run_claude "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    die "unknown command: $cmd"
+    ;;
+esac
