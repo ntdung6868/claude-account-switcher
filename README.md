@@ -149,9 +149,8 @@ claude                                # ... and now 'work'
 ```sh
 csw current   # → personal
 csw list
-#   native-login
-# * personal (native)
-#   work (native)
+# * personal
+#   work
 ```
 
 ---
@@ -162,8 +161,8 @@ csw list
 | --- | --- |
 | `csw` | Open the interactive menu. |
 | `csw save-native <name>` | Snapshot the current native login into `native-accounts/<name>/` and set it active. |
-| `csw use <name>` | Restore a snapshotted profile to the live credential locations. Pass `native-login` to switch to bare native mode (whatever credentials happen to be on disk). |
-| `csw use-native` | Switch to bare native mode without touching the saved profiles. Useful before `csw run auth login --claudeai` to capture a new account. |
+| `csw use <name>` | Restore a snapshotted profile to the live credential locations. Only saved profiles are shown in the switch menu. |
+| `csw use-native` | Switch to bare native mode without touching saved profiles. This is a utility mode for adding/logging in accounts; it is intentionally not shown as a selectable account in the switch menu. |
 | `csw remove-native <name>` | Delete a saved profile. If it was active, also clears the live credentials (file + Keychain + `oauthAccount`). |
 | `csw list` | List all profiles, marking the active one with `*`. |
 | `csw current` | Print the active profile name (or `native-login`). |

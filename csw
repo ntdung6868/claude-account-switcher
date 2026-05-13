@@ -247,7 +247,11 @@ use_account() {
     use_native
     return
   fi
-  [[ -f "$(native_credentials_path "$name")" ]] || die "unknown account: $name"
+  local credential_file
+  credential_file="$(native_credentials_path "$name")"
+  [[ -f "$credential_file" ]] || die "unknown account: $name"
+  profile_credentials_valid "$credential_file" \
+    || die "profile '$name' needs login again. Run: csw use-native && claude auth login --claudeai && csw save-native $name"
   use_native_profile "$name"
 }
 
@@ -324,36 +328,39 @@ active_name() {
   cat "$ACTIVE_NATIVE"
 }
 
+profile_credentials_valid() {
+  local credential_file="$1"
+  [[ -s "$credential_file" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -e '.claudeAiOauth.refreshToken and .claudeAiOauth.accessToken' "$credential_file" >/dev/null 2>&1
+}
+
 list_accounts() {
   ensure_dirs
   local current=""
   current="$(active_name 2>/dev/null || true)"
   local mode=""
   mode="$(active_mode 2>/dev/null || true)"
-  if [[ "$mode" == "native" ]]; then
-    print -- "* native-login"
-  else
-    print -- "  native-login"
-  fi
-  local native_profile native_acct native_marker
+  local native_profile native_acct native_marker found=0
   while IFS= read -r native_profile; do
     [[ -d "$native_profile" ]] || continue
     [[ -f "$native_profile/.credentials.json" ]] || continue
     native_acct="$(basename "$native_profile")"
+    if ! profile_credentials_valid "$native_profile/.credentials.json"; then
+      print -- "  $native_acct (needs login again)"
+      found=1
+      continue
+    fi
     native_marker=" "
     [[ "$mode" == "native-profile" && "$native_acct" == "$current" ]] && native_marker="*"
-    print -- "$native_marker $native_acct (native)"
+    print -- "$native_marker $native_acct"
+    found=1
   done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
-}
-
-list_profiles_raw() {
-  print -- "native-login"
-  local p
-  while IFS= read -r p; do
-    [[ -d "$p" ]] || continue
-    [[ -f "$p/.credentials.json" ]] || continue
-    basename "$p"
-  done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  (( found )) || print -- "(no saved profiles — run: csw save-native <name>)"
+  if [[ "$mode" == "native" ]]; then
+    print -- ""
+    print -- "(no profile applied — using live ~/.claude/.credentials.json directly)"
+  fi
 }
 
 list_named_profiles() {
@@ -361,6 +368,7 @@ list_named_profiles() {
   while IFS= read -r p; do
     [[ -d "$p" ]] || continue
     [[ -f "$p/.credentials.json" ]] || continue
+    profile_credentials_valid "$p/.credentials.json" || continue
     basename "$p"
   done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
 }
@@ -557,24 +565,31 @@ menu_switch() {
   local p
   while IFS= read -r p; do
     profiles+=("$p")
-  done < <(list_profiles_raw)
+  done < <(list_named_profiles)
 
-  local mode_now active_now
-  mode_now="$(active_mode)"
+  ui_clear
+  print_header
+
+  if [[ ${#profiles[@]} -eq 0 ]]; then
+    ui_print "%F{yellow}No saved profiles yet.%f"
+    ui_print ""
+    ui_print "Pick %BSave current login as new profile%b from the main menu first."
+    ui_pause
+    return
+  fi
+
+  local active_now
   active_now="$(active_name 2>/dev/null || true)"
 
   local display=()
   for p in "${profiles[@]}"; do
-    if [[ ("$mode_now" == "native" && "$p" == "native-login") || \
-          ("$mode_now" == "native-profile" && "$p" == "$active_now") ]]; then
+    if [[ "$p" == "$active_now" ]]; then
       display+=("$p  %F{green}✓%f")
     else
       display+=("$p")
     fi
   done
 
-  ui_clear
-  print_header
   local choice
   if ! choice="$(menu_select "Choose profile:" "${display[@]}")"; then
     return
@@ -583,11 +598,7 @@ menu_switch() {
 
   acquire_lock
   local err rc=0
-  if [[ "$target" == "native-login" ]]; then
-    err="$( (use_native >/dev/null) 2>&1 )" || rc=$?
-  else
-    err="$( (use_native_profile "$target" >/dev/null) 2>&1 )" || rc=$?
-  fi
+  err="$( (use_native_profile "$target" >/dev/null) 2>&1 )" || rc=$?
   release_lock
 
   ui_print ""
@@ -764,7 +775,7 @@ csw — Claude Account Switcher
 Usage:
   csw                            Open the interactive menu
   csw save-native <name>         Snapshot current native login as a profile
-  csw use <name>                 Switch to a saved profile (or 'native-login')
+  csw use <name>                 Switch to a saved profile
   csw use-native                 Switch to bare native-login mode
   csw remove-native <name>       Delete a saved profile
   csw list                       List all profiles, with active marked
@@ -782,7 +793,7 @@ Flow to add a new account from the CLI:
 …or just run \`csw\` and use the menu.
 
 Environment variables:
-  CLAUDE_ACCOUNT_DIR       Where profiles and state live (default: script dir)
+  CLAUDE_ACCOUNT_DIR       Where profiles and state live (default: ~/.claude-switcher)
   CLAUDE_HOME_DIR          Real Claude config dir (default: \$HOME/.claude)
   CLAUDE_JSON_FILE         Real Claude top-level config (default: \$HOME/.claude.json)
   CLAUDE_REAL_BIN          Absolute path to the real claude CLI (auto-detected)
