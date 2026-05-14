@@ -178,6 +178,41 @@ clear_live_credentials() {
   fi
 }
 
+claude_cli_version() {
+  local bin version
+  bin="$(real_claude 2>/dev/null)" || return 0
+  [[ -n "$bin" ]] || return 0
+  version="$("$bin" --version 2>/dev/null | awk 'NR == 1 { print $1 }')" || return 0
+  [[ "$version" =~ '^[0-9]+(\.[0-9]+)+' ]] || return 0
+  print -- "$version"
+}
+
+mark_onboarding_complete() {
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local version tmp current_json
+  version="$(claude_cli_version 2>/dev/null || true)"
+  if [[ -z "$version" && -f "$CLAUDE_JSON" ]]; then
+    version="$(jq -r '.lastOnboardingVersion // empty' "$CLAUDE_JSON" 2>/dev/null || true)"
+  fi
+
+  mkdir -p "${CLAUDE_JSON:h}"
+  current_json="$(cat "$CLAUDE_JSON" 2>/dev/null || true)"
+  [[ -n "$current_json" ]] || current_json="{}"
+
+  tmp="$(mktemp "${CLAUDE_JSON}.tmp.XXXXXX")"
+  if ! jq -n --argjson current "$current_json" --arg version "$version" '
+    ($current // {})
+    | .hasCompletedOnboarding = true
+    | if $version != "" then .lastOnboardingVersion = $version else . end
+  ' > "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  mv "$tmp" "$CLAUDE_JSON"
+  chmod 600 "$CLAUDE_JSON" 2>/dev/null || true
+}
+
 # ============================================================================
 # Credential validation
 # ============================================================================
@@ -238,6 +273,7 @@ save_native() {
   print -r -- "native-profile" > "$ACTIVE_MODE"
   print -r -- "$name" > "$ACTIVE_NATIVE"
   chmod 600 "$ACTIVE_MODE" "$ACTIVE_NATIVE"
+  mark_onboarding_complete
   print -- "Saved native Claude Pro profile: $name"
 }
 
@@ -299,6 +335,7 @@ use_native_profile() {
   print -r -- "native-profile" > "$ACTIVE_MODE"
   print -r -- "$name" > "$ACTIVE_NATIVE"
   chmod 600 "$ACTIVE_MODE" "$ACTIVE_NATIVE"
+  mark_onboarding_complete
   print -- "Active Claude native profile: $name"
 }
 

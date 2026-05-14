@@ -45,6 +45,7 @@ The official `claude` CLI stores **one** set of credentials at a time — in `~/
 - **Interactive menu** by default — `csw` with no args opens a polished arrow-key menu.
 - **One-command switching** between any number of accounts.
 - **Preserves native login state** — `/status` shows Email/Organization per profile, not just an opaque "Auth token".
+- **Completes Claude Code onboarding state** after restoring a valid profile, so first-run login-method prompts do not reappear on fresh machines.
 - **Secure by construction** — `umask 077` from line 3, credentials at `0600`, dirs at `0700`.
 - **File-locking** on mutating operations: atomic `mkdir`-based mutex, PID-based stale-lock recovery, configurable timeout.
 - **Schema validation** with `CLAUDE_SKIP_VALIDATION=1` escape hatch if Anthropic ever changes the credential format.
@@ -194,7 +195,7 @@ Native Claude Pro credentials live in three places on macOS:
 2. **macOS Keychain** — entry with service `Claude Code-credentials` (suffixed with a hash of `CLAUDE_CONFIG_DIR` if set), account `$USER`.
 3. **`~/.claude.json`** — top-level config; the `oauthAccount` field is what powers `/status` showing Email/Organization.
 
-`save-native <name>` snapshots all three into `native-accounts/<name>/.credentials.json` and `native-accounts/<name>/oauthAccount.json`. `use <name>` writes them all back. The real `claude` CLI never knows it didn't log in normally.
+`save-native <name>` snapshots all three into `native-accounts/<name>/.credentials.json` and `native-accounts/<name>/oauthAccount.json`. `use <name>` writes them all back. After a valid OAuth profile is saved or restored, `csw` also marks Claude Code onboarding complete in `~/.claude.json`, using the installed Claude Code version when available. The real `claude` CLI never knows it didn't log in normally.
 
 When the active profile is removed, the script wipes all three live locations so the next `claude` run isn't tied to a "deleted" account.
 
@@ -232,6 +233,8 @@ Credential validation checks for `.claudeAiOauth.refreshToken` and `.claudeAiOau
 **`could not acquire lock after 30s`** — another `csw` process is still running or stuck. The script auto-detects stale PIDs; if it still complains, remove `$BASE_DIR/.lock` manually.
 
 **`/status` still shows the old account after switching** — most often means `~/.claude.json` wasn't patched. Make sure `jq` is installed (`brew install jq`), then re-save the profile (`csw save-native`) while logged in as the desired account.
+
+**`claude` still asks you to select a login method after switching** — run `csw use <name>` again with v1.0.2 or newer. This restores the profile and marks Claude Code onboarding complete.
 
 **`interactive menu requires a terminal`** — `csw` was invoked from a non-TTY context (a script, a pipe, CI). Use the CLI subcommands directly: `csw use <name>`, `csw run`, etc.
 
