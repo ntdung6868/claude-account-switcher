@@ -360,7 +360,7 @@ use_account() {
   credential_file="$(native_credentials_path "$name")"
   [[ -f "$credential_file" ]] || die "unknown account: $name"
   profile_credentials_valid "$credential_file" \
-    || die "profile '$name' needs login again. Run: csw use-native && claude auth login --claudeai && csw save-native $name"
+    || die "profile '$name' is not a valid saved Claude login. Log in again, then run: csw save-native $name"
   use_native_profile "$name"
 }
 
@@ -447,29 +447,166 @@ profile_credentials_valid() {
   jq -e '.claudeAiOauth.refreshToken and .claudeAiOauth.accessToken' "$credential_file" >/dev/null 2>&1
 }
 
+credentials_string_valid() {
+  local data="$1"
+  [[ -n "$data" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 0
+  printf '%s' "$data" | jq -e '.claudeAiOauth.refreshToken and .claudeAiOauth.accessToken' >/dev/null 2>&1
+}
+
+live_native_login_valid() {
+  local credentials_json
+  credentials_json="$(read_native_credentials)"
+  credentials_string_valid "$credentials_json"
+}
+
+oauth_account_value() {
+  local field="$1"
+  [[ -f "$CLAUDE_JSON" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg field "$field" '.oauthAccount[$field] // empty' "$CLAUDE_JSON" 2>/dev/null || true
+}
+
+profile_oauth_value() {
+  local profile="$1"
+  local field="$2"
+  local account_file
+  account_file="$(native_dir "$profile")/oauthAccount.json"
+  [[ -s "$account_file" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg field "$field" '.[$field] // empty' "$account_file" 2>/dev/null || true
+}
+
+current_account_key() {
+  local uuid email
+  uuid="$(oauth_account_value accountUuid)"
+  email="$(oauth_account_value emailAddress)"
+  if [[ -n "$uuid" ]]; then
+    print -- "uuid:$uuid"
+  elif [[ -n "$email" ]]; then
+    print -- "email:$email"
+  fi
+}
+
+profile_account_key() {
+  local profile="$1"
+  local uuid email
+  uuid="$(profile_oauth_value "$profile" accountUuid)"
+  email="$(profile_oauth_value "$profile" emailAddress)"
+  if [[ -n "$uuid" ]]; then
+    print -- "uuid:$uuid"
+  elif [[ -n "$email" ]]; then
+    print -- "email:$email"
+  fi
+}
+
+profile_for_live_login() {
+  local current_key
+  current_key="$(current_account_key)"
+  [[ -n "$current_key" ]] || return 1
+
+  local preferred=""
+  preferred="$(active_name 2>/dev/null || true)"
+  if [[ -n "$preferred" && -f "$(native_credentials_path "$preferred")" ]] \
+    && profile_credentials_valid "$(native_credentials_path "$preferred")" \
+    && [[ "$(profile_account_key "$preferred")" == "$current_key" ]]; then
+    print -- "$preferred"
+    return 0
+  fi
+
+  local p name
+  while IFS= read -r p; do
+    [[ -d "$p" ]] || continue
+    [[ -f "$p/.credentials.json" ]] || continue
+    profile_credentials_valid "$p/.credentials.json" || continue
+    name="$(basename "$p")"
+    [[ "$(profile_account_key "$name")" == "$current_key" ]] || continue
+    print -- "$name"
+    return 0
+  done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  return 1
+}
+
+live_login_label() {
+  local email display
+  email="$(oauth_account_value emailAddress)"
+  display="$(oauth_account_value displayName)"
+  if [[ -n "$email" ]]; then
+    print -- "$email"
+  elif [[ -n "$display" ]]; then
+    print -- "$display"
+  elif live_native_login_valid; then
+    print -- "current Claude login"
+  fi
+}
+
+suggest_profile_name() {
+  local label="$1"
+  local base
+  base="${label%%@*}"
+  [[ -n "$base" ]] || base="$label"
+  base="$(print -r -- "$base" | tr '[:upper:]' '[:lower:]')"
+  base="$(print -r -- "$base" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+  [[ -n "$base" ]] || base="account"
+  print -- "$base"
+}
+
+active_display_label() {
+  local saved live_label active
+  if live_native_login_valid; then
+    saved="$(profile_for_live_login 2>/dev/null || true)"
+    if [[ -n "$saved" ]]; then
+      print -- "$saved"
+      return
+    fi
+    live_label="$(live_login_label)"
+    if [[ -n "$live_label" ]]; then
+      print -- "$live_label (unsaved)"
+    else
+      print -- "current Claude login (unsaved)"
+    fi
+    return
+  fi
+
+  active="$(active_name 2>/dev/null || true)"
+  if [[ -n "$active" ]]; then
+    print -- "$active"
+  else
+    print -- "not logged in"
+  fi
+}
+
 list_accounts() {
   ensure_dirs
   local current=""
   current="$(active_name 2>/dev/null || true)"
   local mode=""
   mode="$(active_mode 2>/dev/null || true)"
+  local live_saved="" live_label=""
+  if live_native_login_valid; then
+    live_saved="$(profile_for_live_login 2>/dev/null || true)"
+    live_label="$(live_login_label)"
+    [[ -n "$live_label" ]] || live_label="current Claude login"
+    if [[ -z "$live_saved" ]]; then
+      print -- "* $live_label (current Claude login, unsaved)"
+    fi
+  fi
+
   local native_profile native_acct native_marker found=0
   while IFS= read -r native_profile; do
     [[ -d "$native_profile" ]] || continue
     [[ -f "$native_profile/.credentials.json" ]] || continue
     native_acct="$(basename "$native_profile")"
-    if ! profile_credentials_valid "$native_profile/.credentials.json"; then
-      print -- "  $native_acct (needs login again)"
-      found=1
-      continue
-    fi
+    profile_credentials_valid "$native_profile/.credentials.json" || continue
     native_marker=" "
-    [[ "$mode" == "native-profile" && "$native_acct" == "$current" ]] && native_marker="*"
+    if [[ "$native_acct" == "$live_saved" || ( "$mode" == "native-profile" && "$native_acct" == "$current" && -z "$live_saved" ) ]]; then
+      native_marker="*"
+    fi
     print -- "$native_marker $native_acct"
     found=1
   done < <(find "$NATIVE_ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
-  (( found )) || print -- "(no saved profiles — run: csw save-native <name>)"
-  if [[ "$mode" == "native" ]]; then
+  (( found )) || print -- "(no saved profiles yet)"
+  if [[ "$mode" == "native" && -z "$live_saved" ]]; then
     print -- ""
     print -- "(no profile applied — using live ~/.claude/.credentials.json directly)"
   fi
@@ -640,7 +777,9 @@ prompt_text() {
 confirm() {
   local question="$1"
   local choice
-  if ! choice="$(menu_select "$question" "No" "Yes")"; then
+  if choice="$(menu_select "$question" "No" "Yes")"; then
+    :
+  else
     return 1
   fi
   [[ "$choice" == "2" ]]
@@ -654,8 +793,7 @@ ui_pause() {
 
 print_header() {
   local active_label
-  active_label="$(active_name 2>/dev/null || true)"
-  [[ -z "$active_label" ]] && active_label="native-login"
+  active_label="$(active_display_label)"
   local profile_count
   profile_count=$(list_named_profiles | wc -l | tr -d ' ')
 
@@ -666,6 +804,107 @@ print_header() {
   ui_print "%F{cyan}│%f  %F{magenta}👤%f Profiles: ${profile_count}"
   ui_print "%F{cyan}╰───────────────────────────────────────────╯%f"
   ui_print ""
+}
+
+save_current_login_interactive() {
+  local label default_name name err rc=0
+  if ! live_native_login_valid; then
+    return 0
+  fi
+  if [[ -n "$(profile_for_live_login 2>/dev/null || true)" ]]; then
+    return 0
+  fi
+
+  label="$(live_login_label)"
+  [[ -n "$label" ]] || label="current Claude login"
+  default_name="$(suggest_profile_name "$label")"
+
+  ui_print "%F{yellow}Current Claude login detected:%f %B${label}%b"
+  ui_print "This login is not saved as a csw profile yet."
+  ui_print "Save it first so switching accounts will not lose it."
+  ui_print ""
+
+  name="$(prompt_text "Profile name for current login" "$default_name")"
+  if [[ -z "$name" ]]; then
+    ui_print "%F{red}Cancelled (empty name).%f"
+    return 1
+  fi
+  if ! [[ "$name" =~ '^[A-Za-z0-9._-]+$' ]]; then
+    ui_print "%F{red}Invalid name. Use only letters, numbers, dot, underscore, dash.%f"
+    return 1
+  fi
+  if [[ -d "$NATIVE_ACCOUNTS_DIR/$name" ]]; then
+    if ! confirm "Profile '$name' already exists. Overwrite?"; then
+      return 1
+    fi
+  fi
+
+  acquire_lock
+  err="$( (save_native "$name" >/dev/null) 2>&1 )" || rc=$?
+  release_lock
+  if (( rc != 0 )); then
+    ui_print "%F{red}✗ ${err}%f"
+    return 1
+  fi
+  ui_print "%F{green}✓ Saved current login as %B${name}%b%f"
+  ui_print ""
+  return 0
+}
+
+login_and_save_new_profile_interactive() {
+  acquire_lock
+  use_native >/dev/null 2>&1 || true
+  release_lock
+
+  ui_clear
+  print_header
+  ui_print "%F{cyan}Launching Claude login for the account you want to add…%f"
+  ui_print "%F{8}(complete the browser flow, then come back here)%f"
+  ui_print ""
+  local bin
+  bin="$(real_claude)"
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  unset ANTHROPIC_AUTH_TOKEN
+  ui_show_cursor
+  if ! "$bin" auth login --claudeai; then
+    ui_print ""
+    ui_print "%F{red}Login failed or was cancelled.%f"
+    return 1
+  fi
+
+  ui_print ""
+  local label default_name name
+  label="$(live_login_label)"
+  [[ -n "$label" ]] || label="new Claude login"
+  default_name="$(suggest_profile_name "$label")"
+  name="$(prompt_text "Profile name for this new account" "$default_name")"
+  if [[ -z "$name" ]]; then
+    ui_print "%F{red}Cancelled (empty name).%f"
+    return 1
+  fi
+  if ! [[ "$name" =~ '^[A-Za-z0-9._-]+$' ]]; then
+    ui_print "%F{red}Invalid name. Use only letters, numbers, dot, underscore, dash.%f"
+    return 1
+  fi
+  if [[ -d "$NATIVE_ACCOUNTS_DIR/$name" ]]; then
+    if ! confirm "Profile '$name' already exists. Overwrite?"; then
+      return 1
+    fi
+  fi
+
+  acquire_lock
+  local err rc=0
+  err="$( (save_native "$name" >/dev/null) 2>&1 )" || rc=$?
+  release_lock
+
+  ui_print ""
+  if (( rc == 0 )); then
+    ui_print "%F{green}✓ Saved and switched to %B${name}%b%f"
+  else
+    ui_print "%F{red}✗ ${err}%f"
+    return 1
+  fi
 }
 
 # ============================================================================
@@ -685,9 +924,9 @@ menu_switch() {
   if [[ ${#profiles[@]} -eq 0 ]]; then
     ui_print "%F{yellow}No saved profiles yet.%f"
     ui_print ""
-    ui_print "Pick %BSave current login as new profile%b from the main menu first."
+    ui_print "Pick %BAdd account / save current login%b from the main menu first."
     ui_pause
-    return
+    return 0
   fi
 
   local active_now
@@ -703,8 +942,10 @@ menu_switch() {
   done
 
   local choice
-  if ! choice="$(menu_select "Choose profile:" "${display[@]}")"; then
-    return
+  if choice="$(menu_select "Choose profile:" "${display[@]}")"; then
+    :
+  else
+    return 0
   fi
   local target="${profiles[$choice]}"
 
@@ -725,65 +966,29 @@ menu_switch() {
 menu_save() {
   ui_clear
   print_header
-  ui_print "%BSave a Claude Pro account as a new profile%b"
+  ui_print "%BAdd account / save current login%b"
   ui_print ""
   ui_print "This will:"
-  ui_print "  %F{8}1.%f Reset to fresh native-login mode"
-  ui_print "  %F{8}2.%f Open the Claude OAuth login flow"
-  ui_print "  %F{8}3.%f Ask for a profile name and snapshot the credentials"
+  ui_print "  %F{8}1.%f Detect the Claude login already on this machine"
+  ui_print "  %F{8}2.%f Save it first if it is not a csw profile yet"
+  ui_print "  %F{8}3.%f Open Claude login for the account you want to add"
+  ui_print "  %F{8}4.%f Save the new account and switch to it"
   ui_print ""
-  if ! confirm "Continue?"; then return; fi
-
-  acquire_lock
-  use_native >/dev/null 2>&1 || true
-  release_lock
+  if ! confirm "Continue?"; then return 0; fi
 
   ui_clear
   print_header
-  ui_print "%F{cyan}Launching Claude login…%f"
-  ui_print "%F{8}(complete the browser flow, then come back here)%f"
-  ui_print ""
-  local bin
-  bin="$(real_claude)"
-  unset CLAUDE_CODE_OAUTH_TOKEN
-  unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
-  unset ANTHROPIC_AUTH_TOKEN
-  ui_show_cursor
-  if ! "$bin" auth login --claudeai; then
-    ui_print ""
-    ui_print "%F{red}Login failed or was cancelled.%f"
+  if ! save_current_login_interactive; then
     ui_pause
-    return
+    return 0
   fi
 
-  ui_print ""
-  local name
-  name="$(prompt_text "Profile name for this account")"
-  if [[ -z "$name" ]]; then
-    ui_print "%F{red}Cancelled (empty name).%f"
+  if ! confirm "Log in and add another account now?"; then
     ui_pause
-    return
-  fi
-  if ! [[ "$name" =~ '^[A-Za-z0-9._-]+$' ]]; then
-    ui_print "%F{red}Invalid name. Use only letters, numbers, dot, underscore, dash.%f"
-    ui_pause
-    return
-  fi
-  if [[ -d "$NATIVE_ACCOUNTS_DIR/$name" ]]; then
-    if ! confirm "Profile '$name' already exists. Overwrite?"; then return; fi
+    return 0
   fi
 
-  acquire_lock
-  local err rc=0
-  err="$( (save_native "$name" >/dev/null) 2>&1 )" || rc=$?
-  release_lock
-
-  ui_print ""
-  if (( rc == 0 )); then
-    ui_print "%F{green}✓ Saved profile %B${name}%b%f"
-  else
-    ui_print "%F{red}✗ ${err}%f"
-  fi
+  login_and_save_new_profile_interactive || true
   ui_pause
 }
 
@@ -799,16 +1004,18 @@ menu_remove() {
   if [[ ${#profiles[@]} -eq 0 ]]; then
     ui_print "%F{yellow}No named profiles to remove.%f"
     ui_pause
-    return
+    return 0
   fi
 
   local choice
-  if ! choice="$(menu_select "Choose profile to remove:" "${profiles[@]}")"; then
-    return
+  if choice="$(menu_select "Choose profile to remove:" "${profiles[@]}")"; then
+    :
+  else
+    return 0
   fi
   local target="${profiles[$choice]}"
 
-  if ! confirm "Permanently delete profile '$target'?"; then return; fi
+  if ! confirm "Permanently delete profile '$target'?"; then return 0; fi
 
   acquire_lock
   local err rc=0
@@ -871,19 +1078,22 @@ menu_main() {
   if ! [[ -t 0 && -r /dev/tty ]]; then
     die "interactive menu requires a terminal. Run 'csw help' for the CLI commands."
   fi
+  local choice
   while true; do
     ui_clear
     print_header
 
-    local choice
-    if ! choice="$(menu_select "What do you want to do?" \
+    choice=""
+    if choice="$(menu_select "What do you want to do?" \
         "Switch account" \
-        "Save current login as new profile" \
+        "Add account / save current login" \
         "Remove a profile" \
         "Run claude (with active account)" \
         "Show /status" \
         "Repair session index" \
         "Quit")"; then
+      :
+    else
       ui_clear
       return 0
     fi
@@ -910,7 +1120,7 @@ csw — Claude Account Switcher
 
 Usage:
   csw                            Open the interactive menu
-  csw save-native <name>         Snapshot current native login as a profile
+  csw save-native <name>         Save current Claude Code login as a profile
   csw use <name>                 Switch to a saved profile
   csw use-native                 Switch to bare native-login mode
   csw remove-native <name>       Delete a saved profile
@@ -924,10 +1134,14 @@ Usage:
   csw init                       Create data directories (idempotent)
   csw help                       Show this help
 
-Flow to add a new account from the CLI:
+First run on a machine that already has Claude Code logged in:
+  csw save-native personal
+
+Flow to add another account from the CLI:
+  csw save-native personal        # only needed if the current login is not saved yet
   csw use-native
   csw run auth login --claudeai
-  csw save-native main
+  csw save-native work
 
 …or just run \`csw\` and use the menu.
 
@@ -984,7 +1198,14 @@ case "$cmd" in
     list_accounts
     ;;
   current)
-    if [[ "$(active_mode)" == "native" ]]; then
+    detected="$(profile_for_live_login 2>/dev/null || true)"
+    if [[ -n "$detected" ]]; then
+      print -- "$detected"
+    elif live_native_login_valid; then
+      label="$(live_login_label)"
+      [[ -n "$label" ]] || label="current Claude login"
+      print -- "$label (unsaved)"
+    elif [[ "$(active_mode)" == "native" ]]; then
       print -- "native-login"
     else
       active_name || die "no active account"

@@ -19,7 +19,7 @@ $ csw
 What do you want to do?
 
   ❯ Switch account
-    Save current login as new profile
+    Add account / save current login
     Remove a profile
     Run claude (with active account)
     Show /status
@@ -44,6 +44,7 @@ The official `claude` CLI stores **one** set of credentials at a time — in `~/
 ## Features
 
 - **Interactive menu** by default — `csw` with no args opens a polished arrow-key menu.
+- **First-run account detection** — if Claude Code is already logged in, `csw` shows that current login even before it has been saved as a profile.
 - **One-command switching** between any number of accounts.
 - **Preserves native login state** — `/status` shows Email/Organization per profile, not just an opaque "Auth token".
 - **Completes Claude Code onboarding state** after restoring a valid profile, so first-run login-method prompts do not reappear on fresh machines.
@@ -114,23 +115,24 @@ Profiles and state live in `~/.claude-switcher/` regardless of where the script 
 
 ## Quick start
 
-### Add your first account
+### First run on a machine already logged into Claude Code
 
-Just run `csw`, choose **Save current login as new profile** from the menu, and follow the prompts — it'll reset state, open the Claude OAuth browser flow, ask for a profile name, and snapshot the result.
+Just run `csw`. If Claude Code is already logged in, the header shows that current login as unsaved. Choose **Add account / save current login** to save it as your first profile.
 
 Or do it from the CLI:
 
 ```sh
-csw use-native                       # fresh native-login mode
-csw run auth login --claudeai        # log in via browser
 csw save-native personal             # snapshot under a name
 ```
 
 ### Add a second account
 
-Same steps, different login:
+From the menu, choose **Add account / save current login**. If the current Claude login has not been saved yet, `csw` asks for a profile name and saves it first. Then it opens the Claude OAuth login flow for the new account, asks for the new profile name, saves it, and switches to it.
+
+CLI equivalent:
 
 ```sh
+csw save-native personal             # only needed once if current login is not saved yet
 csw use-native
 csw run auth login --claudeai        # log in as the other account
 csw save-native work
@@ -164,8 +166,8 @@ csw list
 | Command | What it does |
 | --- | --- |
 | `csw` | Open the interactive menu. |
-| `csw save-native <name>` | Snapshot the current native login into `native-accounts/<name>/` and set it active. |
-| `csw use <name>` | Restore a snapshotted profile to the live credential locations. Only saved profiles are shown in the switch menu. |
+| `csw save-native <name>` | Save the current Claude Code login into `native-accounts/<name>/` and set it active. |
+| `csw use <name>` | Restore a saved profile to the live credential locations. Only valid saved profiles are shown in the switch menu. |
 | `csw use-native` | Switch to bare native mode without touching saved profiles. This is a utility mode for adding/logging in accounts; it is intentionally not shown as a selectable account in the switch menu. |
 | `csw remove-native <name>` | Delete a saved profile. If it was active, also clears the live credentials (file + Keychain + `oauthAccount`). |
 | `csw list` | List all profiles, marking the active one with `*`. |
