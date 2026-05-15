@@ -1,6 +1,6 @@
 {
   "name": "claude-cli-switcher",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Switch between multiple Claude Code (Anthropic Pro) accounts on one machine. Snapshot each native login as a profile, swap with one command, /status keeps showing the right Email/Organization. Interactive menu + CLI.",
   "bin": {
     "csw": "csw"

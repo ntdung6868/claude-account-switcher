@@ -140,14 +140,48 @@ keychain_service() {
 }
 
 read_native_credentials() {
-  if [[ -f "$CREDENTIALS_FILE" ]]; then
-    cat "$CREDENTIALS_FILE"
+  local file_credentials=""
+  local keychain_credentials=""
+  [[ -f "$CREDENTIALS_FILE" ]] && file_credentials="$(cat "$CREDENTIALS_FILE" 2>/dev/null || true)"
+
+  keychain_credentials="$(read_keychain_credentials)"
+
+  if [[ -n "$file_credentials" && -n "$keychain_credentials" ]]; then
+    local file_expires_at keychain_expires_at
+    file_expires_at="$(credential_expires_at "$file_credentials")"
+    keychain_expires_at="$(credential_expires_at "$keychain_credentials")"
+    [[ "$file_expires_at" =~ '^[0-9]+$' ]] || file_expires_at=0
+    [[ "$keychain_expires_at" =~ '^[0-9]+$' ]] || keychain_expires_at=0
+    if (( keychain_expires_at > file_expires_at )); then
+      print -r -- "$keychain_credentials"
+    else
+      print -r -- "$file_credentials"
+    fi
     return
   fi
+
+  if [[ -n "$file_credentials" ]]; then
+    print -r -- "$file_credentials"
+    return
+  fi
+  [[ -n "$keychain_credentials" ]] && print -r -- "$keychain_credentials"
+}
+
+read_keychain_credentials() {
+  command -v security >/dev/null 2>&1 || return 0
   local service account
   service="$(keychain_service)"
   account="$(keychain_account)"
   security find-generic-password -a "$account" -w -s "$service" 2>/dev/null || true
+}
+
+credential_expires_at() {
+  local credentials_json="$1"
+  command -v jq >/dev/null 2>&1 || {
+    print -- "0"
+    return
+  }
+  printf '%s' "$credentials_json" | jq -r '.claudeAiOauth.expiresAt // 0 | tostring' 2>/dev/null || print -- "0"
 }
 
 write_native_credentials() {
@@ -301,6 +335,7 @@ save_native() {
   chmod 700 "$profile_dir"
   printf '%s' "$credentials_json" > "$credential_file"
   chmod 600 "$credential_file"
+  write_native_credentials "$credential_file"
 
   if [[ -f "$CLAUDE_JSON" ]] && command -v jq >/dev/null 2>&1; then
     jq '.oauthAccount // empty' "$CLAUDE_JSON" > "$account_file"

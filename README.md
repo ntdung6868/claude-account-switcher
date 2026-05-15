@@ -203,7 +203,7 @@ Native Claude Pro credentials live in three places on macOS:
 2. **macOS Keychain** — entry with service `Claude Code-credentials` (suffixed with a hash of `CLAUDE_CONFIG_DIR` if set), account `$USER`.
 3. **`~/.claude.json`** — top-level config; the `oauthAccount` field is what powers `/status` showing Email/Organization.
 
-`save-native <name>` snapshots all three into `native-accounts/<name>/.credentials.json` and `native-accounts/<name>/oauthAccount.json`. `use <name>` writes them all back. After a valid OAuth profile is saved or restored, `csw` also marks Claude Code onboarding complete in `~/.claude.json`, using the installed Claude Code version when available. The real `claude` CLI never knows it didn't log in normally.
+`save-native <name>` snapshots all three into `native-accounts/<name>/.credentials.json` and `native-accounts/<name>/oauthAccount.json`, then writes the saved credential back to the live file + Keychain so a browser login that only touched Keychain is immediately usable. `use <name>` writes them all back. After a valid OAuth profile is saved or restored, `csw` also marks Claude Code onboarding complete in `~/.claude.json`, using the installed Claude Code version when available. The real `claude` CLI never knows it didn't log in normally.
 
 When the active profile is removed, the script wipes all three live locations so the next `claude` run isn't tied to a "deleted" account.
 
@@ -245,6 +245,15 @@ Credential validation checks for `.claudeAiOauth.refreshToken` and `.claudeAiOau
 **`/status` still shows the old account after switching** — most often means `~/.claude.json` wasn't patched. Make sure `jq` is installed (`brew install jq`), then re-save the profile (`csw save-native`) while logged in as the desired account.
 
 **`claude` still asks you to select a login method after switching** — run `csw use <name>` again with v1.0.2 or newer. This restores the profile and marks Claude Code onboarding complete.
+
+**`Please run /login · API Error: 401 Invalid authentication credentials` after resuming** — the selected profile's OAuth token can no longer refresh. Log in again and re-save the same profile:
+
+```bash
+csw use-native
+csw run auth login --claudeai
+csw save-native <name>
+csw use <name>
+```
 
 **Old conversations disappear from `/resume` after switching accounts** — run `csw repair-sessions` or switch again with `CLAUDE_SESSION_SYNC=1`. The repair step rebuilds `~/.claude.json.projects` from the raw transcript files that Claude keeps under `~/.claude/projects/`.
 
