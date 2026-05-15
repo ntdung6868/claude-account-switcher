@@ -18,6 +18,9 @@ CLAUDE_JSON="${CLAUDE_JSON_FILE:-$HOME/.claude.json}"
 CREDENTIALS_FILE="$CLAUDE_HOME/.credentials.json"
 LOCK_DIR="$BASE_DIR/.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
+LIB_DIR="$SCRIPT_DIR/lib"
+SESSION_HELPER="$LIB_DIR/claude-sessions.py"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ============================================================================
 # Cleanup trap
@@ -93,6 +96,10 @@ acquire_lock() {
     fi
     lock_pid=""
     [[ -f "$LOCK_PID_FILE" ]] && lock_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if [[ -z "$lock_pid" && -d "$LOCK_DIR" && "$waited" -gt 0 ]]; then
+      rm -rf "$LOCK_DIR"
+      [[ ! -d "$LOCK_DIR" ]] && continue
+    fi
     if [[ -n "$lock_pid" && "$lock_pid" != "$$" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
       rm -rf "$LOCK_DIR"
       continue
@@ -214,6 +221,36 @@ mark_onboarding_complete() {
 }
 
 # ============================================================================
+# Session metadata repair
+# ============================================================================
+
+session_sync_enabled() {
+  case "${CLAUDE_SESSION_SYNC:-1}" in
+    0|false|FALSE|no|NO) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+repair_claude_sessions() {
+  session_sync_enabled || return 0
+  if [[ ! -f "$SESSION_HELPER" ]]; then
+    print -u2 -- "Warning: session repair helper missing: $SESSION_HELPER"
+    return 0
+  fi
+  "$PYTHON_BIN" "$SESSION_HELPER" repair \
+    --claude-home "$CLAUDE_HOME" \
+    --claude-json "$CLAUDE_JSON" \
+    || print -u2 -- "Warning: Claude session repair failed. Run 'csw repair-sessions' for details."
+}
+
+session_status_line() {
+  [[ -f "$SESSION_HELPER" ]] || return 0
+  "$PYTHON_BIN" "$SESSION_HELPER" status \
+    --claude-home "$CLAUDE_HOME" \
+    --claude-json "$CLAUDE_JSON" 2>/dev/null || true
+}
+
+# ============================================================================
 # Credential validation
 # ============================================================================
 
@@ -274,6 +311,7 @@ save_native() {
   print -r -- "$name" > "$ACTIVE_NATIVE"
   chmod 600 "$ACTIVE_MODE" "$ACTIVE_NATIVE"
   mark_onboarding_complete
+  repair_claude_sessions
   print -- "Saved native Claude Pro profile: $name"
 }
 
@@ -336,6 +374,7 @@ use_native_profile() {
   print -r -- "$name" > "$ACTIVE_NATIVE"
   chmod 600 "$ACTIVE_MODE" "$ACTIVE_NATIVE"
   mark_onboarding_complete
+  repair_claude_sessions
   print -- "Active Claude native profile: $name"
 }
 
@@ -344,6 +383,7 @@ use_native() {
   print -r -- "native" > "$ACTIVE_MODE"
   chmod 600 "$ACTIVE_MODE"
   rm -f "$ACTIVE_NATIVE"
+  repair_claude_sessions
   print -- "Active Claude mode: native login"
 }
 
@@ -761,6 +801,28 @@ menu_status() {
   unset ANTHROPIC_AUTH_TOKEN
   ui_show_cursor
   "$bin" auth status || true
+  ui_print ""
+  ui_print "%F{cyan}Claude sessions%f"
+  session_status_line | while IFS= read -r line; do
+    ui_print "  $line"
+  done
+  ui_pause
+}
+
+menu_repair_sessions() {
+  ui_clear
+  print_header
+  ui_print "%F{cyan}Repairing Claude session index…%f"
+  ui_print ""
+  acquire_lock
+  local out rc=0
+  out="$( ("$PYTHON_BIN" "$SESSION_HELPER" repair --claude-home "$CLAUDE_HOME" --claude-json "$CLAUDE_JSON") 2>&1 )" || rc=$?
+  release_lock
+  if (( rc == 0 )); then
+    ui_print "%F{green}✓%f $out"
+  else
+    ui_print "%F{red}✗ ${out}%f"
+  fi
   ui_pause
 }
 
@@ -785,6 +847,7 @@ menu_main() {
         "Remove a profile" \
         "Run claude (with active account)" \
         "Show /status" \
+        "Repair session index" \
         "Quit")"; then
       ui_clear
       return 0
@@ -796,7 +859,8 @@ menu_main() {
       3) menu_remove ;;
       4) menu_run_claude ;;
       5) menu_status ;;
-      6) ui_clear; return 0 ;;
+      6) menu_repair_sessions ;;
+      7) ui_clear; return 0 ;;
     esac
   done
 }
@@ -818,6 +882,9 @@ Usage:
   csw list                       List all profiles, with active marked
   csw current                    Print the active profile name
   csw status                     Run 'claude auth status' on the active account
+  csw session-status             Show Claude local session metadata counts
+  csw repair-sessions            Rebuild ~/.claude.json project session pointers
+  csw repair-sessions --dry-run  Show what would be repaired
   csw run [args...]              Run real claude with the active account
   csw init                       Create data directories (idempotent)
   csw help                       Show this help
@@ -835,7 +902,9 @@ Environment variables:
   CLAUDE_JSON_FILE         Real Claude top-level config (default: \$HOME/.claude.json)
   CLAUDE_REAL_BIN          Absolute path to the real claude CLI (auto-detected)
   CLAUDE_LOCK_TIMEOUT      Seconds to wait for lock (default: 30)
+  CLAUDE_SESSION_SYNC      Set to 0 to skip automatic session repair on switch
   CLAUDE_SKIP_VALIDATION   Bypass strict credential schema check
+  PYTHON_BIN               Python interpreter for helper scripts (default: python3)
 EOF
 }
 
@@ -888,6 +957,17 @@ case "$cmd" in
     ;;
   status)
     run_claude auth status
+    ;;
+  session-status)
+    session_status_line
+    ;;
+  repair-sessions|sync-sessions)
+    shift
+    acquire_lock
+    "$PYTHON_BIN" "$SESSION_HELPER" repair \
+      --claude-home "$CLAUDE_HOME" \
+      --claude-json "$CLAUDE_JSON" \
+      "$@"
     ;;
   run)
     shift

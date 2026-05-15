@@ -23,12 +23,13 @@ What do you want to do?
     Remove a profile
     Run claude (with active account)
     Show /status
+    Repair session index
     Quit
 
 [↑↓ navigate · Enter select · Esc/q back]
 ```
 
-Pure zsh, zero runtime dependencies, works alongside the official Claude CLI without touching it.
+Pure zsh with a small Python helper, zero npm runtime dependencies, works alongside the official Claude CLI without touching it.
 
 ---
 
@@ -46,11 +47,12 @@ The official `claude` CLI stores **one** set of credentials at a time — in `~/
 - **One-command switching** between any number of accounts.
 - **Preserves native login state** — `/status` shows Email/Organization per profile, not just an opaque "Auth token".
 - **Completes Claude Code onboarding state** after restoring a valid profile, so first-run login-method prompts do not reappear on fresh machines.
+- **Repairs Claude session visibility** by rebuilding `~/.claude.json.projects` from raw transcripts in `~/.claude/projects/`, so old conversations remain resumable after account switches.
 - **Secure by construction** — `umask 077` from line 3, credentials at `0600`, dirs at `0700`.
 - **File-locking** on mutating operations: atomic `mkdir`-based mutex, PID-based stale-lock recovery, configurable timeout.
 - **Schema validation** with `CLAUDE_SKIP_VALIDATION=1` escape hatch if Anthropic ever changes the credential format.
 - **Auto-cleanup** of live credentials (file + Keychain + `~/.claude.json` `oauthAccount`) when you remove the active profile.
-- **Zero deps** beyond zsh and the real `claude` CLI. `jq` is optional but recommended.
+- **Zero npm deps** beyond zsh, python3, and the real `claude` CLI. `jq` is optional but recommended.
 
 ---
 
@@ -58,6 +60,7 @@ The official `claude` CLI stores **one** set of credentials at a time — in `~/
 
 - macOS (Linux works too — you lose Keychain integration, credentials persist to `~/.claude/.credentials.json` only)
 - `zsh` (default shell on modern macOS)
+- `python3` for the session repair helper
 - The official Claude Code CLI installed somewhere reasonable — `~/.local/bin/claude`, `~/.claude/local/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`, or pointed at via `CLAUDE_REAL_BIN`
 - `jq` (optional) — enables credential schema validation and `~/.claude.json` patching
 
@@ -168,6 +171,9 @@ csw list
 | `csw list` | List all profiles, marking the active one with `*`. |
 | `csw current` | Print the active profile name (or `native-login`). |
 | `csw status` | Run `claude auth status` against the active account. |
+| `csw session-status` | Show local Claude transcript/project-index counts. |
+| `csw repair-sessions` | Rebuild `~/.claude.json.projects` from `~/.claude/projects/**/*.jsonl`. |
+| `csw repair-sessions --dry-run` | Show what session metadata would be repaired without writing. |
 | `csw run [args...]` | Run the real `claude` CLI with the active account. Unsets any `*_AUTH_TOKEN` env vars first. |
 | `csw init` | Create the data directories. Idempotent. |
 | `csw help` | Print full help. |
@@ -183,7 +189,9 @@ csw list
 | `CLAUDE_JSON_FILE` | `$HOME/.claude.json` | Real Claude top-level config (holds `oauthAccount`). |
 | `CLAUDE_REAL_BIN` | (auto-detected) | Absolute path to the real `claude` CLI. The script searches `$HOME/.local/bin/claude`, `$HOME/.claude/local/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude` in order; set this if your install is elsewhere. |
 | `CLAUDE_LOCK_TIMEOUT` | `30` | Seconds to wait for the lock before failing. |
+| `CLAUDE_SESSION_SYNC` | `1` | Set to `0` to skip automatic session repair after `save-native`, `use`, or `use-native`. |
 | `CLAUDE_SKIP_VALIDATION` | (unset) | Set to `1` to bypass strict credential-schema validation. Use only if Anthropic changed the schema and the strict check is wrong. |
+| `PYTHON_BIN` | `python3` | Python interpreter for helper scripts. |
 
 ---
 
@@ -200,6 +208,8 @@ Native Claude Pro credentials live in three places on macOS:
 When the active profile is removed, the script wipes all three live locations so the next `claude` run isn't tied to a "deleted" account.
 
 `csw run [args...]` `exec`s the real CLI after unsetting any `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN` env vars that could shadow the native login.
+
+Claude Code stores conversation transcripts under `~/.claude/projects/<project>/<session-id>.jsonl`, but recent-session pointers live in `~/.claude.json.projects`. `csw repair-sessions` scans the raw transcript files and merges missing or stale project pointers back into `~/.claude.json`. It backs up `~/.claude.json` under `~/.claude/backups/csw-sessions/` before writing and never modifies transcript contents.
 
 ---
 
@@ -235,6 +245,8 @@ Credential validation checks for `.claudeAiOauth.refreshToken` and `.claudeAiOau
 **`/status` still shows the old account after switching** — most often means `~/.claude.json` wasn't patched. Make sure `jq` is installed (`brew install jq`), then re-save the profile (`csw save-native`) while logged in as the desired account.
 
 **`claude` still asks you to select a login method after switching** — run `csw use <name>` again with v1.0.2 or newer. This restores the profile and marks Claude Code onboarding complete.
+
+**Old conversations disappear from `/resume` after switching accounts** — run `csw repair-sessions` or switch again with `CLAUDE_SESSION_SYNC=1`. The repair step rebuilds `~/.claude.json.projects` from the raw transcript files that Claude keeps under `~/.claude/projects/`.
 
 **`interactive menu requires a terminal`** — `csw` was invoked from a non-TTY context (a script, a pipe, CI). Use the CLI subcommands directly: `csw use <name>`, `csw run`, etc.
 

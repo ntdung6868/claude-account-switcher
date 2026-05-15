@@ -1,16 +1,18 @@
 {
   "name": "claude-cli-switcher",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Switch between multiple Claude Code (Anthropic Pro) accounts on one machine. Snapshot each native login as a profile, swap with one command, /status keeps showing the right Email/Organization. Interactive menu + CLI.",
   "bin": {
     "csw": "csw"
   },
   "files": [
     "csw",
+    "lib/claude-sessions.py",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
+    "check": "zsh -n csw && PYTHONPYCACHEPREFIX=/tmp/csw-pycache python3 -m py_compile lib/claude-sessions.py",
     "test": "echo \"Run zsh ./test.sh in a TTY\" && exit 0"
   },
   "repository": {
